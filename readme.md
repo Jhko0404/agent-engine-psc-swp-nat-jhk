@@ -282,8 +282,19 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
     --role="roles/dns.peer"
 ```
 
-##### 5-2. 고정 IP 확인용 에이전트 배포 및 `api.ipify.org` 호출 검증
-4단계에서 만든 `agent-nat-psc-attachment`와 3단계에서 만든 SWP 프록시(`http://10.10.10.50:3128`)를 경유하여 외부 `https://api.ipify.org?format=json`을 호출하는 에이전트를 배포하고 결과를 확인합니다.
+##### 5-2. 에이전트에 적용해야 할 설정/코드 변경 사항 및 배포 검증
+
+기존 에이전트가 우리가 구축한 **PSC Interface + Secure Web Proxy(`http://10.10.10.50:3128`)**를 경유하여 고정 공인 IP로 나가도록 하려면 딱 **2가지 설정**이 필요합니다.
+
+1. **배포 시 네트워크 연결 설정 (`psc_interface_config`)**:
+   * `agent_engines.create()` 호출 시 `psc_interface_config`에 4단계에서 만든 `agent-nat-psc-attachment`를 지정합니다.
+   * 이 설정이 들어가야 Google 관리형 영역의 에이전트 컨테이너에 `10.10.20.x` 대역의 가상 NIC가 연결되어 우리 VPC 내부의 사설 IP인 `10.10.10.50:3128`(SWP)과 통신할 수 있습니다.
+2. **에이전트 외부 호출 시 프록시 주소(`http://10.10.10.50:3128`) 지정**:
+   * **이유**: PSC Interface는 기본적으로 **사설 IP(`10.x.x.x` 등)로 향하는 트래픽만 고객 VPC로 라우팅**합니다. 프록시 지정 없이 공인 도메인(`https://api.ipify.org`, 외부 데이터센터 공인 IP 등)을 그냥 호출하면 PSC Interface를 타지 않고 Google 기본 인터넷 망으로 나가게 됩니다.
+   * 따라서 아래 **방법 A(코드 내 지정)** 또는 **방법 B(코드 수정 없이 환경변수로 일괄 지정)** 중 하나를 선택하여 트래픽이 먼저 SWP 사설 IP(`10.10.10.50:3128`)로 향하도록 구성합니다.
+
+###### 🔹 방법 A: 외부 호출 도구(Tool) 코드에 명시적으로 프록시 지정 및 전체 검증 코드
+특정 외부 데이터센터 API 호출 함수에만 프록시를 적용하고 싶을 때 사용하는 방식입니다. (`requests` 사용 시 `requests.get(url, proxies={"https": SWP_PROXY_URL})`, `httpx` 사용 시 `httpx.Client(proxy=SWP_PROXY_URL)`로 동일하게 적용 가능합니다.)
 
 ```python
 import urllib.request
@@ -301,6 +312,7 @@ vertexai.init(project=PROJECT_ID, location=LOCATION, staging_bucket=STAGING_BUCK
 
 class NatEgressTestAgent:
     def query(self, question: str = "check") -> dict:
+        # [핵심 2] HTTP 클라이언트에 SWP 사설 IP:포트(10.10.10.50:3128)를 프록시로 등록
         proxy_handler = urllib.request.ProxyHandler({
             "http": SWP_PROXY_URL,
             "https": SWP_PROXY_URL,
@@ -314,7 +326,7 @@ class NatEgressTestAgent:
             "detected_egress_public_ip": ip_data,
         }
 
-# 1. PSC Interface(agent-nat-psc-attachment)를 연결하여 에이전트 배포
+# 1. [핵심 1] PSC Interface(agent-nat-psc-attachment)를 연결하여 에이전트 배포
 remote_agent = agent_engines.create(
     agent_engine=NatEgressTestAgent(),
     display_name="agent-nat-swp-verify-agent",
@@ -330,6 +342,26 @@ print("배포 완료 리소스명:", remote_agent.resource_name)
 # 2. 배포된 에이전트 호출 테스트 (detected_egress_public_ip가 34.64.196.163과 일치하는지 확인)
 result = remote_agent.query(question="현재 에이전트가 외부로 나가는 공인 IP가 무엇인가요?")
 print("검증 결과:", result)
+```
+
+###### 🔹 방법 B: 기존 에이전트 코드 수정 없이 배포 환경변수(`env_vars`)로 일괄 적용 (실무 권장 팁)
+이미 작성된 에이전트의 Python 도구 코드를 수정하기 어렵다면, Python 표준 HTTP 라이브러리(`requests`, `urllib`, `httpx` 등)가 자동으로 인식하는 `HTTP_PROXY` / `HTTPS_PROXY` 환경변수를 배포 시점(`env_vars`)에 주입하여 **코드 한 줄 수정 없이** 프록시를 경유하게 할 수 있습니다.
+
+> **⚠️ 주의 (`NO_PROXY` 필수 지정)**: Gemini 모델 호출 등 Google Cloud 내부 API(`*.googleapis.com`)는 SWP 프록시를 타지 않도록 반드시 `NO_PROXY`에 예외 도메인을 함께 등록하세요.
+
+```python
+remote_agent = agent_engines.create(
+    agent_engine=my_existing_agent,  # 기존 에이전트 코드 그대로 사용
+    display_name="my-production-agent",
+    psc_interface_config=aiplatform_v1.PscInterfaceConfig(
+        network_attachment=NETWORK_ATTACHMENT
+    ),
+    env_vars={
+        "HTTP_PROXY": "http://10.10.10.50:3128",
+        "HTTPS_PROXY": "http://10.10.10.50:3128",
+        "NO_PROXY": "localhost,127.0.0.1,169.254.169.254,.googleapis.com,.google.com",
+    },
+)
 ```
 
 ##### 5-3. 실제 환경 배포 및 테스트 검증 결과 (`gemeni-workshop` / `asia-northeast3`)
