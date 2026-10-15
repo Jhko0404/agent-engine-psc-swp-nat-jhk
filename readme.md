@@ -6,6 +6,8 @@
 
 ### 1. 기본 구조에서 발생하는 문제와 해결 원리
 
+![Chapter 1: Dynamic Egress Problem vs. Static IP Solution](assets/chapter1_problem_vs_solution.png)
+
 * **기본 직접 Egress 사용 시 문제점**:
   * Agent Platform(또는 Agent Engine)의 기본 인터넷 Egress는 Google 내부 테넌트 풀의 공용 IP 대역을 동적으로 공유하여 나갑니다.
   * 이 대역은 IP가 유동적이고 Google Cloud 전체 사용자 대역과 겹치므로 데이터센터 방화벽에 단일 고정 IP로 등록할 수 없습니다.
@@ -19,47 +21,6 @@
 ### 2. 네트워크 흐름 다이어그램
 
 ![Vertex AI Agent Engine Static IP Egress Architecture](assets/arch_overview_flow.png)
-
-```dot
-digraph FixedIpEgress {
-  rankdir=LR;
-  graph [fontname="Google Sans, Arial", fontsize=10];
-  node [fontname="Google Sans, Arial", fontsize=9, shape=box, style="rounded,filled", fillcolor="#f8f9fa", color="#bdc1c6"];
-  edge [fontname="Google Sans, Arial", fontsize=8, color="#5f6368"];
-
-  subgraph cluster_tenant {
-    label="Google-Managed Tenant";
-    style="filled";
-    fillcolor="#f1f3f4";
-    Agent [label="Agent Platform Runtime\n(Agent Engine / CES)", fillcolor="#d2e3fc"];
-    PSCI [label="PSC Interface\n(eth1)", fillcolor="#fedfc8"];
-  }
-
-  subgraph cluster_customer_vpc {
-    label="Customer VPC (GCP Project)";
-    style="dashed";
-    color="#34a853";
-    NetAttach [label="Network Attachment\n(Subnet: 10.10.20.0/28)", fillcolor="#fedfc8"];
-    ProxyVM [label="Forward Proxy / SWP VM\n(Squid / Envoy / SWP)\nInternal IP: 10.10.10.x", fillcolor="#e6f4ea"];
-    CloudNAT [label="Cloud Router + Cloud NAT\n(수동 할당된 고정 공용 IP)\n예: 34.64.x.y", fillcolor="#ceead6"];
-  }
-
-  subgraph cluster_onprem {
-    label="On-Premises / Remote Data Center";
-    style="dashed";
-    color="#ea4335";
-    FW [label="DC 방화벽 (Firewall)\n[화이트리스트 등록: 34.64.x.y]", fillcolor="#fce8e6"];
-    TargetAPI [label="내부 API 서버 / DB\n(Public IP 노출 서비스)", fillcolor="#fce8e6"];
-  }
-
-  Agent -> PSCI [label="도구/API 호출"];
-  PSCI -> NetAttach [label="PSC 터널"];
-  NetAttach -> ProxyVM [label="VPC 라우팅"];
-  ProxyVM -> CloudNAT [label="인터넷 Egress 라우팅"];
-  CloudNAT -> FW [label="고정 소스 IP (34.64.x.y)"];
-  FW -> TargetAPI [label="허용 및 전달"];
-}
-```
 
 ---
 
@@ -90,7 +51,7 @@ gcloud compute networks subnets create agent-proxy-subnet \
 
 #### 1단계: 고정 외부 IP 주소 예약 (Static External IP)
 
-![Step 1 & 2: Static External IP & Cloud NAT](assets/step1_2_static_ip_nat.png)
+![Step 1: Regional Static External IP Reservation](assets/step1_static_ip_reservation.png)
 
 Cloud NAT 게이트웨이에 바인딩할 리전 단위 고정 IP를 예약합니다.
 
@@ -114,6 +75,9 @@ Cloud NAT 게이트웨이에 바인딩할 리전 단위 고정 IP를 예약합�
   ```
 
 #### 2단계: Cloud Router 및 SWP 전용 Cloud NAT (Manual Allocation) 구성
+
+![Step 2: Static External IP & Cloud NAT (ENDPOINT_TYPE_SWG)](assets/step2_cloud_nat_swg.png)
+
 자동 IP 할당(`--auto-allocate-nat-external-ips`) 대신 **수동 IP 할당 모드**를 지정하여 방금 예약한 고정 IP(`RESERVED` 상태인 `agent-nat-static-ip-2`)를 등록합니다.
 
 > **⚠️ 핵심 주의 (`--endpoint-types=ENDPOINT_TYPE_SWG` 및 `--min-ports-per-vm=1024`)**:
@@ -261,53 +225,6 @@ gcloud compute routers get-status $SWG_ROUTER --region=asia-northeast3
 
 ![Step 4: PSC Interface & Network Attachment Connection](assets/step4_psc_interface.png)
 
-```dot
-digraph Step4PscInterface {
-  rankdir=LR;
-  graph [fontname="Google Sans, Arial", fontsize=10, pad="0.3", nodesep="0.4", ranksep="0.7"];
-  node [fontname="Google Sans, Arial", fontsize=9, shape=box, style="rounded,filled", fillcolor="#f8f9fa", color="#bdc1c6"];
-  edge [fontname="Google Sans, Arial", fontsize=8, color="#5f6368"];
-
-  subgraph cluster_google_tenant {
-    label="1. Google 관리형 테넌트 영역\n(Vertex AI Agent Engine)";
-    style="filled,rounded";
-    fillcolor="#e8f0fe";
-    color="#4285f4";
-
-    AgentRuntime [label="Agent 컨테이너\n(Reasoning Engine)", fillcolor="#ffffff", color="#4285f4"];
-    PscNic [label="PSC Interface (가상 NIC)\n자동 할당 IP: 10.10.20.2\n(고객 VPC 대역 IP를 직접 부여받음)", fillcolor="#d2e3fc", color="#1967d2"];
-    AgentRuntime -> PscNic [label="외부 호출 발생"];
-  }
-
-  subgraph cluster_customer_vpc {
-    label="2. 고객 프로젝트 VPC (agent-nat-vpc)";
-    style="dashed,rounded";
-    color="#34a853";
-
-    subgraph cluster_psc_subnet {
-      label="① agent-psc-subnet\n(10.10.20.0/28)";
-      style="filled,rounded";
-      fillcolor="#fef7e0";
-      color="#fbbc04";
-
-      NetAttach [label="② Network Attachment\n[agent-nat-psc-attachment]\n(ACCEPT_AUTOMATIC:\n연결 요청 자동 승인 콘센트)", fillcolor="#feefc3", color="#f29900"];
-    }
-
-    subgraph cluster_proxy_subnet {
-      label="agent-proxy-subnet\n(10.10.10.0/24)";
-      style="filled,rounded";
-      fillcolor="#e6f4ea";
-      color="#34a853";
-
-      SWP [label="3단계 SWP 프록시\n[agent-swp-gateway]\n사설 IP: 10.10.10.50:3128", fillcolor="#ceead6", color="#137333"];
-    }
-  }
-
-  PscNic -> NetAttach [label="③ 배포 시 자동 플러그인\n(psc_interface_config)", color="#d93025", penwidth=1.8];
-  NetAttach -> SWP [label="④ 동일 VPC 내부 사설 통신\n(10.10.20.2 -> 10.10.10.50:3128)", color="#137333", penwidth=1.5];
-}
-```
-
 * **핵심 역할 요약**:
   1. **`agent-psc-subnet` (`10.10.20.0/28`)**: 구글 관리형 영역에 있는 에이전트에게 빌려줄 사설 IP 묶음(풀)입니다.
   2. **`agent-nat-psc-attachment` (`Network Attachment`)**: 에이전트가 우리 VPC(`agent-nat-vpc`)에 가상 랜선(NIC)을 꽂을 수 있게 해주는 **연결 포트(콘센트)**입니다. `--connection-preference=ACCEPT_AUTOMATIC`으로 설정하여 에이전트 배포 시 별도 수동 승인 없이 즉시 연결됩니다.
@@ -453,6 +370,8 @@ print("검증 결과:", result)
 ---
 
 ### 4. 대안: 전용선/VPN을 통한 사설망(Private) 연동 (권장 검토)
+
+![Chapter 4: Alternative Private Hybrid Connectivity (VPN / Interconnect)](assets/chapter4_hybrid_vpn_interconnect.png)
 
 만약 데이터센터가 이미 GCP와 **Cloud Interconnect(전용선)** 또는 **Cloud VPN**으로 연결되어 있다면, 트래픽을 굳이 공용 인터넷으로 돌리지 않고 **내부 사설 IP로 직접 통신**하는 것이 보안 및 지연시간 측면에서 훨씬 유리합니다.
 
