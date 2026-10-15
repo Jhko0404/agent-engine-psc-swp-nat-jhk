@@ -18,6 +18,8 @@
 
 ### 2. 네트워크 흐름 다이어그램
 
+![Vertex AI Agent Engine Static IP Egress Architecture](assets/arch_overview_flow.png)
+
 ```dot
 digraph FixedIpEgress {
   rankdir=LR;
@@ -64,6 +66,9 @@ digraph FixedIpEgress {
 ### 3. 단계별 구축 방법
 
 #### 0단계: 에이전트 NAT 전용 VPC(`agent-nat-vpc`) 및 프록시 서브넷(`agent-proxy-subnet`) 생성
+
+![Step 0: Custom VPC & Proxy Subnet Foundation](assets/step0_vpc_subnet.png)
+
 기존에 사용 중인 VPC가 없다면 아래 명령어로 에이전트 외부 통신을 위한 커스텀 VPC(`agent-nat-vpc`)와 프록시를 배치할 기본 사설 서브넷(`agent-proxy-subnet`)을 먼저 생성합니다.
 
 > **💡 참고**: 프로젝트 내 기존 VPC 목록을 먼저 확인하려면 `gcloud compute networks list` 명령어를 실행하세요. 만약 기존 VPC(예: `vertexai-network`)를 그대로 사용하려면 이후 단계의 `--network=agent-nat-vpc`를 `--network=vertexai-network`로 변경하여 실행하면 됩니다.
@@ -84,6 +89,9 @@ gcloud compute networks subnets create agent-proxy-subnet \
 ```
 
 #### 1단계: 고정 외부 IP 주소 예약 (Static External IP)
+
+![Step 1 & 2: Static External IP & Cloud NAT](assets/step1_2_static_ip_nat.png)
+
 Cloud NAT 게이트웨이에 바인딩할 리전 단위 고정 IP를 예약합니다.
 
 > **⚠️ 주의**: 동일한 리전 내에 기존 이름(`agent-nat-static-ip`)과 중복되는 IP 리소스가 있으면 생성 시 오류(`already exists`)가 발생합니다. 생성 전 아래 명령어로 기존에 생성된 IP가 있는지 먼저 확인하세요.
@@ -108,37 +116,48 @@ Cloud NAT 게이트웨이에 바인딩할 리전 단위 고정 IP를 예약합�
 #### 2단계: Cloud Router 및 SWP 전용 Cloud NAT (Manual Allocation) 구성
 자동 IP 할당(`--auto-allocate-nat-external-ips`) 대신 **수동 IP 할당 모드**를 지정하여 방금 예약한 고정 IP(`RESERVED` 상태인 `agent-nat-static-ip-2`)를 등록합니다.
 
-> **⚠️ 핵심 주의 (`--endpoint-types=ENDPOINT_TYPE_SWG`)**:
-> Cloud NAT의 기본 엔드포인트 타입은 일반 VM용(`ENDPOINT_TYPE_VM`)입니다. **Secure Web Proxy(SWP)**에서 나가는 트래픽을 고정 IP로 SNAT 처리하려면 반드시 **`--endpoint-types=ENDPOINT_TYPE_SWG`** 옵션을 명시해야 합니다.
+> **⚠️ 핵심 주의 (`--endpoint-types=ENDPOINT_TYPE_SWG` 및 `--min-ports-per-vm=1024`)**:
+> 1. Cloud NAT의 기본 엔드포인트 타입은 일반 VM용(`ENDPOINT_TYPE_VM`)입니다. **Secure Web Proxy(SWP)**에서 나가는 트래픽을 고정 IP로 SNAT 처리하려면 반드시 **`--endpoint-types=ENDPOINT_TYPE_SWG`** 옵션을 명시해야 합니다.
+> 2. SWP는 내부적으로 여러 대의 관리형 Envoy 프록시 인스턴스를 실행하며, SWP용 Cloud NAT의 기본 `min-ports-per-vm` 값(32,768)을 그대로 두면 단일 고정 IP(총 64,512 포트)로 1대의 Envoy에만 포트가 할당되어 타임아웃이 발생할 수 있습니다. 반드시 **`--min-ports-per-vm=1024`**를 함께 지정하여 모든 SWP 인스턴스에 NAT 포트가 고르게 분배(`minExtraNatIpsNeeded: 0`)되도록 설정하세요.
+> 3. 만약 3단계(SWP 배포)를 먼저 실행한 경우, GCP가 자동으로 `swg-autogen-router-*` 및 `swg-autogen-nat`를 생성합니다. 이 경우 아래 `update` 명령어로 자동 생성된 `swg-autogen-nat`에 고정 IP와 `--min-ports-per-vm=1024`를 바인딩하면 됩니다.
 
 ```bash
 # 1. 기존 Cloud Router 목록 확인
 gcloud compute routers list --regions=asia-northeast3
 
-# 2. 에이전트 NAT 전용 Cloud Router(agent-nat-router) 생성
+# 2-A. 직접 Cloud Router 및 SWP 전용 Cloud NAT를 먼저 생성하는 경우
 gcloud compute routers create agent-nat-router \
     --network=agent-nat-vpc \
     --region=asia-northeast3
 
-# 3. SWP 전용 Cloud NAT(agent-nat-gateway) 생성 및 고정 IP(agent-nat-static-ip-2) 바인딩
 gcloud compute routers nats create agent-nat-gateway \
     --router=agent-nat-router \
     --region=asia-northeast3 \
     --endpoint-types=ENDPOINT_TYPE_SWG \
     --nat-all-subnet-ip-ranges \
-    --nat-external-ip-pool=agent-nat-static-ip-2
+    --nat-external-ip-pool=agent-nat-static-ip-2 \
+    --min-ports-per-vm=1024
 
-# 4. 생성된 Cloud NAT 목록 확인 (ENDPOINT_TYPE_SWG 확인)
-gcloud compute routers nats list \
-    --router=agent-nat-router \
-    --region=asia-northeast3
+# 2-B. (SWP가 자동 생성한 swg-autogen-nat를 사용하는 경우) 고정 IP 수동 바인딩 및 최소 포트 조정
+export SWG_ROUTER=$(gcloud compute routers list --filter="network:agent-nat-vpc AND name~^swg-autogen-router" --format="value(name)")
+gcloud compute routers nats update swg-autogen-nat \
+    --router=$SWG_ROUTER \
+    --region=asia-northeast3 \
+    --nat-external-ip-pool=agent-nat-static-ip-2 \
+    --min-ports-per-vm=1024
+
+# 3. Cloud NAT 포트 할당 상태 확인 (minExtraNatIpsNeeded: 0 및 userAllocatedNatIps: 34.64.196.163 확인)
+gcloud compute routers get-status $SWG_ROUTER --region=asia-northeast3
 ```
 
 #### 3단계: 고객 VPC에 프록시(Forward Proxy) 구성 - Google Cloud Secure Web Proxy (SWP 무인증서 모드)
+
+![Step 3: Secure Web Proxy (SWP) Explicit Mode Without TLS Certs](assets/step3_swp_proxy.png)
+
 에이전트가 PSC Interface를 통해 도구 호출을 수행할 때, 공용 인터넷 목적지 도메인(`https://api.datacenter.com`)을 안전하게 처리할 완전 관리형 **Google Cloud Secure Web Proxy (SWP)**를 VPC 서브넷(`agent-proxy-subnet`)에 배치합니다.
 
 > **💡 핵심 포인트 (TLS 인증서 없이 SWP 배포하기)**:
-> SWP 게이트웨이 YAML 작성 시 불필요한 `scope` 필드와 `certificateUrls` 필드를 제외하고 `routingMode: EXPLICIT_ROUTING_MODE`로 지정하면, **별도의 TLS 인증서 생성/등록 없이도 표준 HTTP 프록시(`http://10.10.10.50:3128`)로 즉시 배포**할 수 있습니다.
+> SWP 게이트웨이 YAML 작성 시 불필요한 `scope` 필드와 `certificateUrls` 필드를 제외하고 `routingMode: EXPLICIT_ROUTING_MODE`로 지정하면, **별도의 TLS 인증서 생성/등록 없이도 표준 HTTP CONNECT 프록시(`http://10.10.10.50:3128`)로 즉시 배포**할 수 있습니다.
 
 ##### 📊 Secure Web Proxy (SWP) 특징 및 장점
 
@@ -240,6 +259,8 @@ gcloud compute routers nats list \
 
 ##### 🗺️ 4단계 동작 구조 다이어그램 (PSC Interface 연결 원리)
 
+![Step 4: PSC Interface & Network Attachment Connection](assets/step4_psc_interface.png)
+
 ```dot
 digraph Step4PscInterface {
   rankdir=LR;
@@ -313,12 +334,14 @@ gcloud compute network-attachments list --regions=asia-northeast3
 
 #### 5단계: 데이터센터 방화벽 화이트리스트 등록 및 고정 IP(`api.ipify.org`) 검증
 
+![Step 5: End-to-End Static IP Verification](assets/step5_egress_verification.png)
+
 실제 고객사 환경에서는 1단계에서 예약한 고정 외부 IP(`agent-nat-static-ip-2`: **`34.64.196.163`**)를 데이터센터 인바운드 방화벽(WAF/보안장비)에 **Source IP**로 허용 등록합니다.
 
 별도의 데이터센터 서버가 없는 테스트 환경에서는, 요청자의 공인 IP를 그대로 반환해 주는 공개 API(**`https://api.ipify.org?format=json`**)를 호출하는 에이전트를 배포하여 **에이전트의 외부 진출(Egress) IP가 정확히 `34.64.196.163`으로 찍히는지 검증**합니다.
 
 ##### 5-1. 예약된 고정 공인 IP 확인 및 IAM 권한 부여 (최초 1회)
-Vertex AI Reasoning Engine 서비스 에이전트가 `agent-nat-psc-attachment`에 네트워크 인터페이스를 연결할 수 있도록 `compute.networkAdmin` 권한을 부여합니다.
+Vertex AI Reasoning Engine 서비스 에이전트가 `agent-nat-psc-attachment`에 네트워크 인터페이스를 연결할 수 있도록 `compute.networkAdmin` 및 `dns.peer` 권한을 부여합니다.
 
 ```bash
 export PROJECT_ID=$(gcloud config get-value project)
@@ -336,6 +359,10 @@ echo "데이터센터 방화벽에 등록할 고정 공인 IP: $STATIC_NAT_IP"
 gcloud projects add-iam-policy-binding $PROJECT_ID \
     --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-aiplatform-re.iam.gserviceaccount.com" \
     --role="roles/compute.networkAdmin"
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-aiplatform-re.iam.gserviceaccount.com" \
+    --role="roles/dns.peer"
 ```
 
 ##### 5-2. 고정 IP 확인용 에이전트 배포 및 `api.ipify.org` 호출 검증
@@ -344,7 +371,8 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
 ```python
 import urllib.request
 import vertexai
-from vertexai.preview import reasoning_engines
+from vertexai import agent_engines
+from google.cloud import aiplatform_v1
 
 PROJECT_ID = "gemeni-workshop"
 LOCATION = "asia-northeast3"
@@ -362,7 +390,7 @@ class NatEgressTestAgent:
         })
         opener = urllib.request.build_opener(proxy_handler)
         with opener.open("https://api.ipify.org?format=json", timeout=10) as response:
-            ip_data = response.read().decode("utf-8")
+            ip_data = response.read().decode("utf-8").strip()
         return {
             "question": question,
             "swp_proxy_used": SWP_PROXY_URL,
@@ -370,13 +398,14 @@ class NatEgressTestAgent:
         }
 
 # 1. PSC Interface(agent-nat-psc-attachment)를 연결하여 에이전트 배포
-remote_agent = reasoning_engines.ReasoningEngine.create(
-    NatEgressTestAgent(),
+remote_agent = agent_engines.create(
+    agent_engine=NatEgressTestAgent(),
     display_name="agent-nat-swp-verify-agent",
     description="Agent Engine Egress Fixed IP Verification via SWP and Cloud NAT",
-    psc_interface_config={
-        "network_attachment": NETWORK_ATTACHMENT,
-    },
+    requirements=[],
+    psc_interface_config=aiplatform_v1.PscInterfaceConfig(
+        network_attachment=NETWORK_ATTACHMENT
+    ),
 )
 
 print("배포 완료 리소스명:", remote_agent.resource_name)
@@ -386,15 +415,40 @@ result = remote_agent.query(question="현재 에이전트가 외부로 나가는
 print("검증 결과:", result)
 ```
 
-* **정상 검증 결과 예시**:
+##### 5-3. 실제 환경 배포 및 테스트 검증 결과 (`gemeni-workshop` / `asia-northeast3`)
+
+* **배포된 Agent Engine 리소스**:
+  `projects/329992103474/locations/asia-northeast3/reasoningEngines/5176447967011274752`
+* **1) Network Attachment (`agent-nat-psc-attachment`) 자동 연결 확인**:
+  구글 테넌트 프로젝트(`721146520683`)가 `agent-psc-subnet`의 `10.10.20.2`, `10.10.20.3` 사설 IP를 자동 할당받아 `ACCEPTED` 상태로 연결됨을 확인했습니다.
+  ```yaml
+  connectionEndpoints:
+  - ipAddress: 10.10.20.2
+    projectIdOrNum: '721146520683'
+    status: ACCEPTED
+    subnetwork: .../regions/asia-northeast3/subnetworks/agent-psc-subnet
+  - ipAddress: 10.10.20.3
+    projectIdOrNum: '721146520683'
+    status: ACCEPTED
+    subnetwork: .../regions/asia-northeast3/subnetworks/agent-psc-subnet
+  ```
+* **2) SWP (`agent-swp-gateway`) Cloud Logging 통과 확인**:
+  에이전트(`10.10.20.3`)가 `10.10.10.50:3128`로 보낸 `CONNECT api.ipify.org:443` 요청이 `allow-datacenter-api` 규칙에 의해 `ALLOWED` 처리되었습니다.
+* **3) 에이전트 쿼리(`api.ipify.org`) 최종 응답 결과**:
   ```json
   {
-    "question": "현재 에이전트가 외부로 나가는 공인 IP가 무엇인가요?",
-    "swp_proxy_used": "http://10.10.10.50:3128",
-    "detected_egress_public_ip": "{\"ip\":\"34.64.196.163\"}"
+    "status": "SUCCESS",
+    "proxy_used": "http://10.10.10.50:3128",
+    "detected_egress_public_ip": "{\"ip\":\"34.64.196.163\"}",
+    "details": {
+      "https://api.ipify.org?format=json": {
+        "status": "SUCCESS",
+        "body": "{\"ip\":\"34.64.196.163\"}"
+      }
+    }
   }
   ```
-  `detected_egress_public_ip` 값이 `agent-nat-static-ip-2`의 IP인 **`34.64.196.163`**으로 출력되면 전체 구간(`Agent Engine` $\rightarrow$ `PSC Interface` $\rightarrow$ `SWP` $\rightarrow$ `Cloud NAT 고정 IP`)이 완벽하게 동작하는 것입니다.
+  `detected_egress_public_ip` 값이 `agent-nat-static-ip-2`의 고정 공인 IP인 **`34.64.196.163`**과 정확히 일치하여 전체 구간(`Agent Engine` $\rightarrow$ `PSC Interface (10.10.20.3)` $\rightarrow$ `SWP (10.10.10.50:3128)` $\rightarrow$ `Cloud NAT (34.64.196.163)`)이 완벽하게 검증되었습니다.
 
 ---
 
